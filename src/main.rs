@@ -1,29 +1,44 @@
+#![warn(missing_debug_implementations)]
+// #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 #![deny(clippy::all)]
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_sign_loss)]
 
+use std::{hash::Hasher, time::Instant};
+
 use anyhow::{Context, Result};
-use byteorder::ByteOrder;
-use byteorder::LittleEndian;
-use clap::App;
-use clap::Arg;
-use image::imageops::FilterType;
+use clap::{App, Arg};
+use image::{imageops::FilterType, GenericImage, Rgb, Rgba, EncodableLayout};
 use nucleid::{
     BufferType, ConnectorStatus, ConnectorUpdate, Device, Format, ObjectUpdate, PlaneType,
     PlaneUpdate,
 };
+use qrcode::QrCode;
+use serde::Serialize;
 use simplelog::{ColorChoice, Config, LevelFilter, TermLogger, TerminalMode};
-use std::hash::Hasher;
-use twox_hash::XxHash32;
+use twox_hash::XxHash64;
 
-const HEADER_VERSION_MAJOR: u8 = 1;
+const QRCODE_WIDTH: usize = 128;
+const QRCODE_HEIGHT: usize = 128;
+
+const HEADER_VERSION_MAJOR: u8 = 2;
 const HEADER_VERSION_MINOR: u8 = 0;
-const HEADER_MAGIC: u32 = u32::from_ne_bytes(*b"CRNO");
 
-const NUM_BUFFERS: u32 = 3;
+const NUM_BUFFERS: u64 = 3;
 
 const PATTERN: &[u8] = include_bytes!("../resources/smpte-color-bars.png");
+
+#[derive(Serialize)]
+struct Metadata {
+    version: (u8, u8),
+    qrcode_width: usize,
+    qrcode_height: usize,
+    width: usize,
+    height: usize,
+    hash: u64,
+    index: u64,
+}
 
 fn main() -> Result<()> {
     let matches = App::new("KMS Crash Test Pattern")
@@ -97,35 +112,31 @@ fn main() -> Result<()> {
         })
         .context("Couldn't find a plane with the proper format")?;
 
-    let img = image::load_from_memory(PATTERN)
+    let mut img = image::load_from_memory(PATTERN)
         .context("Couldn't load our image")?
         .resize_exact(width as u32, height as u32, FilterType::Nearest);
-    let img_data = img.to_bgr8().into_vec();
 
-    let mut hasher = XxHash32::with_seed(0);
-    hasher.write(&img_data[16..]);
-    let hash = hasher.finish() as u32;
+    for x in 0..QRCODE_WIDTH {
+        for y in 0..QRCODE_HEIGHT {
+            img.put_pixel(x as u32, y as u32, Rgba([0, 0, 0, 255]));
+        }
+    }
+
+    let mut img = img.to_rgb8();
+
+    let mut hasher = XxHash64::with_seed(0);
+    hasher.write(img.as_bytes());
+    let hash = hasher.finish() as u64;
 
     log::info!("Hash {:#x}", hash);
 
     let mut buffers: Vec<_> = Vec::new();
     for _idx in 0..NUM_BUFFERS {
-        let mut buffer = device
+        let buffer = device
             .allocate_buffer(BufferType::Dumb, width, height, 24)
             .unwrap()
             .into_framebuffer(Format::RGB888)
             .unwrap();
-
-        let data = buffer.data();
-        data.copy_from_slice(&img_data);
-
-        data[0] = HEADER_VERSION_MAJOR;
-        data[1] = HEADER_VERSION_MINOR;
-        data[2] = 0;
-        data[3] = 0;
-        LittleEndian::write_u32(&mut data[4..8], HEADER_MAGIC);
-        LittleEndian::write_u32(&mut data[8..12], 0);
-        LittleEndian::write_u32(&mut data[12..16], hash);
 
         buffers.push(buffer);
     }
@@ -155,14 +166,38 @@ fn main() -> Result<()> {
 
     log::info!("Starting to output");
 
-    let mut index = 0;
+    let mut index: u64 = 0;
     loop {
+        let frame_start = Instant::now();
+
         let buffer = &mut buffers[(index % NUM_BUFFERS) as usize];
         let data = buffer.data();
 
-        LittleEndian::write_u32(&mut data[8..12], index);
-
         log::debug!("Switching to frame {}", index);
+
+        let metadata = Metadata {
+            version: (HEADER_VERSION_MAJOR, HEADER_VERSION_MINOR),
+            qrcode_width: QRCODE_WIDTH,
+            qrcode_height: QRCODE_HEIGHT,
+            width,
+            height,
+            hash,
+            index,
+        };
+
+        let json = serde_json::to_string(&metadata).unwrap();
+
+        log::debug!("Metadata {:#?}", json);
+
+        let qrcode = QrCode::new(json.as_bytes())
+            .unwrap()
+            .render::<Rgb<u8>>()
+            .min_dimensions(QRCODE_WIDTH as u32, QRCODE_HEIGHT as u32)
+            .max_dimensions(QRCODE_WIDTH as u32, QRCODE_HEIGHT as u32)
+            .build();
+
+        image::imageops::overlay(&mut img, &qrcode, 0, 0);
+        data.copy_from_slice(img.as_bytes());
 
         output = output
             .start_update()
@@ -170,5 +205,10 @@ fn main() -> Result<()> {
             .commit()?;
 
         index += 1;
+
+        log::debug!(
+            "Took {} ms to generate the frame",
+            frame_start.elapsed().as_millis()
+        );
     }
 }
